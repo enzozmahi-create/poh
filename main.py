@@ -1,4 +1,5 @@
 import os
+import base64
 import httpx
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,13 +16,17 @@ app.add_middleware(
 
 HIVE_API_KEY = os.environ.get("HIVE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-HIVE_URL = "https://api.thehive.ai/api/v2/task/sync"
+HIVE_URL = "https://api.thehive.ai/api/v3/hive/ai-generated-and-deepfake-content-detection"
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 
 
 @app.get("/")
 def root():
-    return {"status": "POH backend running", "hive": bool(HIVE_API_KEY), "claude": bool(ANTHROPIC_API_KEY)}
+    return {
+        "status": "POH backend running",
+        "hive": bool(HIVE_API_KEY),
+        "claude": bool(ANTHROPIC_API_KEY)
+    }
 
 
 @app.post("/detect")
@@ -34,15 +39,27 @@ async def detect(
     if not file and not url:
         raise HTTPException(status_code=400, detail="Provide either a file or a URL.")
 
-    headers = {"Authorization": f"Token {HIVE_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {HIVE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    if file:
+        # Read file and convert to base64
+        contents = await file.read()
+        b64 = base64.b64encode(contents).decode("utf-8")
+        mime = file.content_type or "image/jpeg"
+        payload = {
+            "input": [{"media_base64": f"data:{mime};base64,{b64}"}]
+        }
+    else:
+        # Use URL directly
+        payload = {
+            "input": [{"media_url": url}]
+        }
 
     async with httpx.AsyncClient(timeout=60) as client:
-        if file:
-            contents = await file.read()
-            files = {"media": (file.filename, contents, file.content_type)}
-            hive_response = await client.post(HIVE_URL, headers=headers, files=files)
-        else:
-            hive_response = await client.post(HIVE_URL, headers=headers, data={"url": url})
+        hive_response = await client.post(HIVE_URL, headers=headers, json=payload)
 
     if hive_response.status_code != 200:
         raise HTTPException(
@@ -58,26 +75,26 @@ async def detect(
             explanation = await get_claude_explanation(hive_data)
             hive_data["explanation"] = explanation
         except Exception:
-            pass  # Claude explanation is optional — don't fail if it errors
+            pass
 
     return JSONResponse(content=hive_data)
 
 
 async def get_claude_explanation(hive_data: dict) -> str:
-    output = hive_data.get("status", [{}])[0].get("response", {}).get("output", [{}])[0]
-    classes = output.get("classes", [])
+    # V3 response format: output[0].classes with "value" field
+    output = hive_data.get("output", [{}])
+    classes = output[0].get("classes", []) if output else []
 
     def get_score(name):
-        return next((c["score"] for c in classes if c["class"] == name), 0)
+        return next((c["value"] for c in classes if c["class"] == name), 0)
 
     ai_score = get_score("ai_generated")
     deepfake_score = get_score("deepfake")
-    real_score = get_score("real")
-    not_ai_score = get_score("not_ai_generated")
+    real_score = get_score("not_ai_generated")
 
     combined = max(ai_score, deepfake_score)
     verdict = "AI-generated" if combined > 0.5 else "authentic human"
-    confidence = round(combined * 100 if combined > 0.5 else max(not_ai_score, real_score, 1 - combined) * 100)
+    confidence = round(combined * 100 if combined > 0.5 else real_score * 100)
 
     signals = []
     if ai_score > 0.05:
@@ -85,10 +102,7 @@ async def get_claude_explanation(hive_data: dict) -> str:
     if deepfake_score > 0.05:
         signals.append(f"Deepfake probability: {round(deepfake_score * 100)}%")
     if real_score > 0.5:
-        signals.append(f"Real human face detected: {round(real_score * 100)}%")
-    for c in classes:
-        if c["class"] not in ["ai_generated", "not_ai_generated", "deepfake", "real"] and c["score"] > 0.2:
-            signals.append(f"{c['class'].replace('_', ' ')}: {round(c['score'] * 100)}%")
+        signals.append(f"Not AI-generated probability: {round(real_score * 100)}%")
 
     signal_text = "\n".join(f"- {s}" for s in signals) if signals else "- No strong signals detected"
 
@@ -109,8 +123,16 @@ Be specific but accessible. No bullet points. Under 200 words."""
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             CLAUDE_URL,
-            headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 400, "messages": [{"role": "user", "content": prompt}]}
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": prompt}]
+            }
         )
 
     data = response.json()
